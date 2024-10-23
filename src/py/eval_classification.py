@@ -46,7 +46,7 @@ def plot_confusion_matrix(cm, classes,
     plt.yticks(tick_marks, classes)
 
     fmt = '.3f' if normalize else 'd'
-    thresh = cm.max() / 2.
+    thresh = .5 if normalize else np.sum(cm)/4
     for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
         plt.text(j, i, format(cm[i, j], fmt),
                  horizontalalignment="center",
@@ -57,6 +57,22 @@ def plot_confusion_matrix(cm, classes,
     plt.tight_layout()
 
     return cm
+
+
+def remove_labels(df, args):
+  if args.drop_labels is not None:
+      df = df[ ~ df[args.label_column].isin(args.drop_labels)]
+
+  if args.concat_labels is not None:
+      replacement_val = df.loc[ df['label'] == args.concat_labels[0]]['class'].unique()
+      df.loc[ df['label'].isin(args.concat_labels), "class" ] = replacement_val[0]
+
+  unique_classes = sorted(df[args.csv_true_column].unique())
+  class_mapping = {value: idx for idx, value in enumerate(unique_classes)}
+
+  df[args.csv_true_column] = df[args.csv_true_column].map(class_mapping)
+  print(f"Kept Classes : {df[args.csv_tag_column].unique()}, {class_mapping}")
+  return df
 
 def main(args):
 
@@ -69,12 +85,14 @@ def main(args):
   else:        
       df = pd.read_parquet(args.csv)
 
-  if(args.csv_tag_column):
-    class_names = df[[args.csv_tag_column, args.csv_prediction_column]].drop_duplicates()[args.csv_tag_column]
-    class_names.sort()
-  else:
-    class_names = pd.unique(df[args.csv_prediction_column])
-    class_names.sort()
+  df_train = remove_labels(df, args)
+
+  # if(args.csv_tag_column):
+  #   class_names = df[[args.csv_tag_column, args.csv_true_column]].drop_duplicates()
+  #   class_names = class_names.sort_values(by=[args.csv_true_column])[args.csv_tag_column]
+  # else:
+  class_names = pd.unique(df[args.csv_prediction_column])
+  class_names.sort()
 
 
   for idx, row in df.iterrows():
@@ -83,6 +101,10 @@ def main(args):
 
   report = classification_report(y_true_arr, y_pred_arr, output_dict=True)
   print(json.dumps(report, indent=2))
+  df_report = pd.DataFrame(report).transpose()
+  report_filename = os.path.splitext(args.csv)[0] + "_classification_report.csv"
+  df_report.to_csv(report_filename)
+
 
   cnf_matrix = confusion_matrix(y_true_arr, y_pred_arr)
   np.set_printoptions(precision=3)
@@ -112,6 +134,7 @@ def main(args):
 
     with open(probs_fn, 'rb') as f:
       y_scores = np.array(pickle.load(f))
+      # y_scores = np.array(pickle.load(f))[0]
 
   features_fn = args.csv.replace("_prediction.csv", "_features.pickle")
   if os.path.exists(features_fn):
@@ -171,9 +194,9 @@ def main(args):
     report["macro avg"]["auc"] = np.average(auc) 
     report["weighted avg"]["auc"] = np.average(auc, weights=support) 
         
-    df_report = pd.DataFrame(report).transpose()
-    report_filename = os.path.splitext(args.csv)[0] + "_classification_report.csv"
-    df_report.to_csv(report_filename)
+  df_report = pd.DataFrame(report).transpose()
+  report_filename = os.path.splitext(args.csv)[0] + "_classification_report.csv"
+  df_report.to_csv(report_filename)
 
 
 def get_argparse():
@@ -185,6 +208,10 @@ def get_argparse():
   parser.add_argument('--csv_prediction_column', type=str, help='csv true class', default='pred')
   parser.add_argument('--title', type=str, help='Title for the image', default="Confusion matrix")
   parser.add_argument('--figsize', type=float, nargs='+', help='Figure size', default=(6.4, 4.8))
+
+  parser.add_argument('--drop_labels', type=str, default=None, nargs='+', help='drop labels in dataframe')
+  parser.add_argument('--concat_labels', type=str, default=None, nargs='+', help='concat labels in dataframe')
+
 
   return parser
 
