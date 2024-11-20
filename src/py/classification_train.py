@@ -10,14 +10,14 @@ import torch
 from nets import classification
 from loaders.tt_dataset import TTDataModule, TrainTransforms, EvalTransforms
 
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.strategies.ddp import DDPStrategy
-from pytorch_lightning.loggers import NeptuneLogger, TensorBoardLogger
-from pytorch_lightning import loggers as pl_loggers
+from lightning import Trainer
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.strategies.ddp import DDPStrategy
+from lightning.pytorch.loggers import NeptuneLogger, TensorBoardLogger
+from lightning.pytorch import loggers as pl_loggers
 
-# from pytorch_lightning.callbacks import QuantizationAwareTraining
+# from lightning.pytorch.callbacks import QuantizationAwareTraining
 # from torch.utils.mobile_optimizer import optimize_for_mobile
 
 from sklearn.utils import class_weight
@@ -49,7 +49,6 @@ def remove_labels(df, args):
 
 
 def main(args):
-    import pdb
     df_train = pd.read_csv(args.csv_train)
     df_val = pd.read_csv(args.csv_valid)    
     df_test = pd.read_csv(args.csv_test)
@@ -83,6 +82,8 @@ def main(args):
 
         g_val = df_val.groupby(args.class_column)
         df_val = g_val.apply(lambda x: x.sample(g_val.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+        unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y=df_train[args.class_column]))
+        args_params['class_weights'] = unique_class_weights
     
 
     ttdata = TTDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point)
@@ -180,6 +181,8 @@ if __name__ == '__main__':
     hparams_group.add_argument('--batch_size', help='Batch size', type=int, default=256)
     hparams_group.add_argument('--nn', help='Type of neural network', type=str, default="efficientnet_v2s")    
     hparams_group.add_argument('--patience', help='Max number of patience steps for EarlyStopping', type=int, default=30)
+    hparams_group.add_argument('--feature_size', help='dimension of feature space', type=int, default=1536)
+    hparams_group.add_argument('--dropout', help='dropout', type=float, default=0.2)
 
     logger_group = parser.add_argument_group('Logger')
     logger_group.add_argument('--log_every_n_steps', help='Log every n steps', type=int, default=50)    
