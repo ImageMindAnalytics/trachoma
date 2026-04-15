@@ -4,17 +4,6 @@ import argparse
 from collections import namedtuple
 
 import torch
-import monai
-
-from monai.transforms import (
-    AsChannelFirst,
-    ScaleIntensity,
-    ToTensor,
-    ToNumpy,
-    AsChannelLast, 
-    Lambda,
-    Compose
-)
 from nets.segmentation import TTUNet,TTRCNN
 from loaders.tt_dataset import InTransformsSeg, OutTransformsSeg
 
@@ -24,8 +13,6 @@ import os
 import sys
 import pickle
 import pandas as pd
-
-# import tensorflow as tf
 
 class bcolors:
     HEADER = '\033[95m'
@@ -141,7 +128,7 @@ def main(args):
                     os.makedirs(out_seg_res_dir)
             
             if args.ow or (not os.path.exists(out_seg) or not os.path.exists(out_seg_res)):
-                img_out.append({'img': os.path.join(args.csv_root,row[args.img_column]), 'out_seg': out_seg, 'out_seg_res': out_seg_res})
+                img_out.append({'img': row[args.img_column], 'out_seg': out_seg, 'out_seg_res': out_seg_res})
 
         df_out = pd.DataFrame(img_out)
 

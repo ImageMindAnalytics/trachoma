@@ -10,7 +10,6 @@ def resample_fn(img, args):
     output_size = args.size 
     fit_spacing = args.fit_spacing
     iso_spacing = args.iso_spacing
-    pixel_dimension = args.pixel_dimension
     center = args.center
 
     # if(pixel_dimension == 1):
@@ -74,13 +73,6 @@ def resample_fn(img, args):
 
 
 def Resample(img_filename, args):
-
-    output_size = args.size 
-    fit_spacing = args.fit_spacing
-    iso_spacing = args.iso_spacing
-    img_dimension = args.image_dimension
-    pixel_dimension = args.pixel_dimension
-    center = args.center
 
     print("Reading:", img_filename) 
     img = sitk.ReadImage(img_filename)

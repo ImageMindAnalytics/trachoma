@@ -28,9 +28,11 @@ class SegImageLogger(Callback):
                 trainer.logger.experiment.add_image('x_hat', grid_img3[0:max_num_image], pl_module.global_step)
 
 class SegImageLoggerNeptune(Callback):
-    def __init__(self, num_images=12, log_steps=100):
+    def __init__(self, num_images=4, nrow=2, log_steps=100):
         self.log_steps = log_steps
         self.num_images = num_images        
+        self.nrow = nrow
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
         
         if batch_idx % self.log_steps == 0:
@@ -39,14 +41,17 @@ class SegImageLoggerNeptune(Callback):
             img2 = batch["seg"]
             
             max_num_image = min(img1.shape[0], self.num_images)
-            grid_img1 = torchvision.utils.make_grid(img1, nrow=max_num_image)
+            img1 = torch.clip(img1[0:max_num_image], 0, 1)
+            img2 = img2[0:max_num_image]
+
+            grid_img1 = torchvision.utils.make_grid(img1, nrow=self.nrow)
             
             fig = plt.figure(figsize=(7, 9))
             ax = plt.imshow(grid_img1.permute(1, 2, 0).cpu().numpy())
             trainer.logger.experiment["images/img"].upload(fig)
             plt.close()
             
-            grid_img2 = torchvision.utils.make_grid(img2/torch.max(img2))
+            grid_img2 = torchvision.utils.make_grid(img2/torch.max(img2), nrow=self.nrow)
             fig = plt.figure(figsize=(7, 9))
             ax = plt.imshow(grid_img2.permute(1, 2, 0).cpu().numpy())
             trainer.logger.experiment["images/seg"].upload(fig)
@@ -54,6 +59,7 @@ class SegImageLoggerNeptune(Callback):
 
             with torch.no_grad():
                 x_hat = pl_module(img1)
+                x_hat = torch.argmax(x_hat, dim=1, keepdim=True)
                 grid_img3 = torchvision.utils.make_grid(x_hat/torch.max(x_hat))
                 fig = plt.figure(figsize=(7, 9))
                 ax = plt.imshow(grid_img3.permute(1, 2, 0).cpu().numpy())

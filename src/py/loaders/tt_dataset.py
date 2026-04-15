@@ -1,3 +1,4 @@
+import pickle
 from torch.utils.data import Dataset, DataLoader
 import pdb
 import pandas as pd
@@ -9,7 +10,8 @@ import math
 import torch
 import lightning.pytorch as pl
 from torchvision import transforms
-from torchvision.transforms import functional as F
+from torchvision.transforms import functional as FV
+import torch.nn.functional as F
 import albumentations as A
 import cv2
 import monai
@@ -23,7 +25,6 @@ from monai.transforms import (
     ScaleIntensity,
     ToTensor,    
     ToNumpy,
-    AddChanneld,
     AsChannelLastd,
     CenterSpatialCropd,
     EnsureChannelFirstd,
@@ -42,6 +43,8 @@ from torchvision.ops import nms
 import random
 from monai.data.utils import pad_list_data_collate
 
+from typing import Dict, Sequence, Tuple, Optional
+
 class TTDatasetSeg(Dataset):
     def __init__(self, df, mount_point="./", img_column="img_path", seg_column="seg_path", class_column='class'):
         self.df = df        
@@ -56,16 +59,16 @@ class TTDatasetSeg(Dataset):
         img = os.path.join(self.mount_point, row[self.img_column])
         seg = os.path.join(self.mount_point, row[self.seg_column])
 
-        img_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img)).copy())).to(torch.float32)
-        seg_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg)).copy())).to(torch.float32)
+        img_t = torch.from_numpy(sitk.GetArrayFromImage(sitk.ReadImage(img))).to(torch.float32)
+        seg_t = torch.from_numpy(sitk.GetArrayFromImage(sitk.ReadImage(seg))).to(torch.float32)
 
-        if len(np.unique(seg_t)) == 2: ## contain only eyelid 
-            seg_t = (seg_t == np.unique(seg_t)[1]).float()
+        # if len(np.unique(seg_t)) == 2: ## contain only eyelid 
+        #     seg_t = (seg_t == np.unique(seg_t)[1]).float()
             
-        elif len(np.unique(seg_t)) == 4 :# if contain entire eye segmented
-            seg_t = (seg_t == 3).float()
-        else:
-            return self.__getitem__(random.randint(0, len(self) - 1))
+        # elif len(np.unique(seg_t)) == 4 :# if contain entire eye segmented
+        #     seg_t = (seg_t == 3).float()
+        # else:
+        #     return self.__getitem__(random.randint(0, len(self) - 1))
         # # ### preprocess image
         # bbx_eye = self.compute_eye_bbx(seg_t, pad=0.01)
         # img_t = img_t[bbx_eye[1]:bbx_eye[3],bbx_eye[0]:bbx_eye[2]]
@@ -285,7 +288,7 @@ class TTDatasetPatch(Dataset):
 
 
     def resize_to_fix_height(self, image):
-        resized_image = F.resize(image, size=self.target_size[0])
+        resized_image = FV.resize(image, size=self.target_size[0])
 
         scale_y = resized_image.shape[1] / image.shape[1]
         scale_x = resized_image.shape[2] / image.shape[2]
@@ -440,8 +443,11 @@ class TTDataModuleSeg(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, 
                                                                     # collate_fn=classification_collate_fn,
-                                                                    collate_fn=pad_list_data_collate,
-                                                                    shuffle=True)
+                                                                    # collate_fn=pad_list_data_collate,
+                                                                    shuffle=True, 
+                                                                    prefetch_factor=1, 
+                                                                    pin_memory=True,
+                                                                    persistent_workers=True,)
 
     def val_dataloader(self):
         return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, 
@@ -874,6 +880,547 @@ class RandomIntensity:
             return X
         return X
 
+class ResizeGridSampledTorch:
+    """
+    Dict-style resize using grid_sample.
+    Applies the SAME resize mapping to all tensors in `keys`.
+
+    Input tensors must be (B,C,H,W) or (C,H,W). All keys must share the same H,W.
+    """
+    def __init__(
+        self,
+        keys: Sequence[str],
+        out_size: Tuple[int, int],                 # (H_out, W_out)
+        padding_mode: str = "zeros",
+        align_corners: bool = False,
+        mode_map: Optional[Dict[str, str]] = None, # {"img":"bilinear","seg":"nearest"}
+    ):
+        self.keys = list(keys)
+        self.out_size = tuple(out_size)
+        self.padding_mode = padding_mode
+        self.align_corners = align_corners
+        self.mode_map = mode_map or {}
+        self.grid = self._make_resize_grid(out_size[0], out_size[1], device="cpu")  # dummy grid
+
+    @staticmethod
+    def _ensure_bchw(x: torch.Tensor):
+        if x.ndim == 3:
+            return x.unsqueeze(0), True
+        if x.ndim == 4:
+            return x, False
+        raise ValueError(f"Expected (C,H,W) or (B,C,H,W), got {tuple(x.shape)}")
+
+    def _make_resize_grid(
+        self,
+        H_out: int,
+        W_out: int,
+        device,
+    ) -> torch.Tensor:
+        """
+        Builds grid (B, H_out, W_out, 2) in normalized coords [-1,1],
+        mapping output pixel locations to input sampling locations.
+        """
+        # Output coordinates in normalized space of output grid
+        ys = torch.linspace(-1.0, 1.0, H_out, device=device)
+        xs = torch.linspace(-1.0, 1.0, W_out, device=device)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")  # (H_out, W_out)
+
+        # For pure resize, we can sample input at the same normalized coords.
+        # This is correct because grid_sample interprets normalized coords on the *input* domain.
+        grid = torch.stack([gx, gy], dim=-1)  # (H_out, W_out, 2)
+        return grid
+
+    def __call__(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(data)
+
+        # pick reference tensor to define B,H,W + device/dtype
+        ref = None
+        for k in self.keys:
+            if k in out:
+                ref = out[k]
+                break
+        if ref is None:
+            return out
+
+        ref, ref_added_batch = self._ensure_bchw(ref)
+        B, _, H_in, W_in = ref.shape
+        H_out, W_out = self.out_size
+        device = ref.device
+
+        grid = self.grid
+        grid = grid.to(device=device)
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1).contiguous()
+
+        # Apply same grid to all keys
+        for k in self.keys:
+            if k not in out:
+                continue
+            x, added_batch = self._ensure_bchw(out[k])
+
+            if x.shape[-2:] != (H_in, W_in):
+                raise ValueError(
+                    f"All keys must share same input H,W. Key '{k}' has {tuple(x.shape[-2:])}, ref is {(H_in,W_in)}."
+                )
+
+            mode = self.mode_map.get(k, "bilinear")
+            y = F.grid_sample(
+                x,
+                grid,
+                mode=mode,
+                padding_mode=self.padding_mode,
+                align_corners=self.align_corners,
+            )
+            out[k] = y.squeeze(0) if added_batch else y
+
+        return out
+    
+class RandZoomdTorch:
+    """
+    RandZoomd-like transform for dict batches.
+    Applies the SAME random zoom (and optional center jitter) to all tensors in `keys`.
+
+    Expected each entry to be (B,C,H,W) or (C,H,W). If (C,H,W), it will be treated as B=1.
+    """
+    def __init__(
+        self,
+        keys: Sequence[str],
+        zoom_range: Tuple[float, float] = (0.8, 1.2),
+        prob: float = 1.0,
+        center_jitter: float = 0.0,
+        padding_mode: str = "zeros",
+        align_corners: bool = False,
+        mode_map: Optional[Dict[str, str]] = None,  # e.g. {"img": "bilinear", "seg": "nearest"}
+    ):
+        self.keys = list(keys)
+        self.zoom_range = zoom_range
+        self.prob = prob
+        self.center_jitter = center_jitter
+        self.padding_mode = padding_mode
+        self.align_corners = align_corners
+        self.mode_map = mode_map or {}
+
+    @torch.no_grad()
+    def _make_grid(self, B: int, H: int, W: int, device, dtype):
+        ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        base = torch.stack([gx, gy], dim=-1)  # (H,W,2)
+        return base.unsqueeze(0).expand(B, -1, -1, -1).contiguous()
+
+    def __call__(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(data)
+
+        # Find a reference tensor to define B,H,W + device/dtype
+        ref = None
+        for k in self.keys:
+            if k in out:
+                ref = out[k]
+                break
+        if ref is None:
+            return out
+
+        # Normalize shapes to (B,C,H,W)
+        def ensure_bchw(x: torch.Tensor):
+            if x.ndim == 3:
+                return x.unsqueeze(0), True  # added batch
+            if x.ndim == 4:
+                return x, False
+            raise ValueError(f"Expected (C,H,W) or (B,C,H,W), got {tuple(x.shape)}")
+
+        ref_bchw, ref_added_batch = ensure_bchw(ref)
+        B, _, H, W = ref_bchw.shape
+        device, dtype = ref_bchw.device, ref_bchw.dtype
+
+        # Single random draw for this call -> SAME transform for all keys
+        if torch.rand(1, device=device).item() >= self.prob:
+            return out  # no-op
+
+        zmin, zmax = self.zoom_range
+        if zmin > zmax:
+            zmin, zmax = zmax, zmin
+        zoom = torch.empty(1, device=device, dtype=dtype).uniform_(zmin, zmax).item()
+
+        if self.center_jitter > 0:
+            cx = torch.empty(1, device=device, dtype=dtype).uniform_(-self.center_jitter, self.center_jitter).item()
+            cy = torch.empty(1, device=device, dtype=dtype).uniform_(-self.center_jitter, self.center_jitter).item()
+        else:
+            cx, cy = 0.0, 0.0
+
+        # Build one grid and reuse for all keys
+        base_grid = self._make_grid(B, H, W, device=device, dtype=dtype)
+        c = torch.tensor([cx, cy], device=device, dtype=dtype).view(1, 1, 1, 2)
+        grid = (base_grid - c) / zoom + c  # (B,H,W,2)
+
+        # Apply to each key with per-key interpolation mode (img vs seg)
+        for k in self.keys:
+            if k not in out:
+                continue
+            x, added_batch = ensure_bchw(out[k])
+
+            # Sanity: require same spatial size; if not, you can resample per-key separately
+            if x.shape[-2:] != (H, W):
+                raise ValueError(
+                    f"All keys must share same H,W. Key '{k}' has {tuple(x.shape[-2:])}, ref is {(H,W)}."
+                )
+
+            mode = self.mode_map.get(k, "bilinear")
+            y = F.grid_sample(
+                x,
+                grid,
+                mode=mode,
+                padding_mode=self.padding_mode,
+                align_corners=self.align_corners,
+            )
+
+            out[k] = y.squeeze(0) if added_batch else y
+
+        return out
+
+class RandRotateGridSampledTorch:
+    """
+    Dict-style random rotation using grid_sample.
+    Applies the SAME random rotation to all tensors in `keys`.
+
+    Supports tensors shaped (B,C,H,W) or (C,H,W).
+    All keys must share the same H,W.
+    """
+    def __init__(
+        self,
+        keys: Sequence[str],
+        angle_range: Tuple[float, float] = (-15.0, 15.0),  # degrees by default
+        prob: float = 1.0,
+        degrees: bool = True,
+        center: str = "image",              # "image" only in this simple version
+        translate: Tuple[float, float] = (0.0, 0.0),  # max translation in normalized coords (tx, ty)
+        padding_mode: str = "zeros",
+        align_corners: bool = False,
+        mode_map: Optional[Dict[str, str]] = None,      # {"img":"bilinear","seg":"nearest"}
+    ):
+        self.keys = list(keys)
+        self.angle_range = angle_range
+        self.prob = prob
+        self.degrees = degrees
+        self.center = center
+        self.translate = translate
+        self.padding_mode = padding_mode
+        self.align_corners = align_corners
+        self.mode_map = mode_map or {}
+
+    @staticmethod
+    def _ensure_bchw(x: torch.Tensor):
+        if x.ndim == 3:
+            return x.unsqueeze(0), True
+        if x.ndim == 4:
+            return x, False
+        raise ValueError(f"Expected (C,H,W) or (B,C,H,W), got {tuple(x.shape)}")
+
+    def _base_grid(self, B: int, H: int, W: int, device, dtype):
+        ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        base = torch.stack([gx, gy], dim=-1)  # (H,W,2)
+        return base.unsqueeze(0).expand(B, -1, -1, -1).contiguous()
+
+    def __call__(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(data)
+
+        # Reference tensor
+        ref = None
+        for k in self.keys:
+            if k in out:
+                ref = out[k]
+                break
+        if ref is None:
+            return out
+
+        ref, _ = self._ensure_bchw(ref)
+        B, _, H, W = ref.shape
+        device, dtype = ref.device, ref.dtype
+
+        # Decide apply once per call (same params for all keys)
+        if torch.rand(1, device=device).item() >= self.prob:
+            return out
+
+        a0, a1 = self.angle_range
+        if a0 > a1:
+            a0, a1 = a1, a0
+
+        angle = torch.empty(1, device=device, dtype=dtype).uniform_(a0, a1).item()
+        if self.degrees:
+            angle = math.radians(angle)
+
+        # Optional translation (in normalized coords)
+        tx_max, ty_max = self.translate
+        if tx_max > 0:
+            tx = torch.empty(1, device=device, dtype=dtype).uniform_(-tx_max, tx_max).item()
+        else:
+            tx = 0.0
+        if ty_max > 0:
+            ty = torch.empty(1, device=device, dtype=dtype).uniform_(-ty_max, ty_max).item()
+        else:
+            ty = 0.0
+
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+
+        # Build a single grid: rotate around image center in normalized coords
+        base = self._base_grid(B, H, W, device=device, dtype=dtype)  # (B,H,W,2)
+        x = base[..., 0]
+        y = base[..., 1]
+
+        # Rotation about (0,0) is rotation about image center because normalized coords are centered.
+        x2 = cos_a * x - sin_a * y + tx
+        y2 = sin_a * x + cos_a * y + ty
+
+        grid = torch.stack([x2, y2], dim=-1)  # (B,H,W,2)
+
+        # Apply to all keys with per-key interpolation
+        for k in self.keys:
+            if k not in out:
+                continue
+            t, added_batch = self._ensure_bchw(out[k])
+
+            if t.shape[-2:] != (H, W):
+                raise ValueError(
+                    f"All keys must share same H,W. Key '{k}' has {tuple(t.shape[-2:])}, ref is {(H,W)}."
+                )
+
+            mode = self.mode_map.get(k, "bilinear")
+            yk = F.grid_sample(
+                t,
+                grid,
+                mode=mode,
+                padding_mode=self.padding_mode,
+                align_corners=self.align_corners,
+            )
+            out[k] = yk.squeeze(0) if added_batch else yk
+
+        return out
+
+class RandZoomRotateResizedGridTorch:
+    """
+    Dict-style transform combining:
+      - Random zoom
+      - Random rotation
+      - Resize to out_size
+
+    Uses ONE affine grid shared across all keys.
+    Applies one grid_sample per key (no grouping by interpolation mode).
+
+    Input tensors must be (B,C,H,W) or (C,H,W).
+    All keys must share the same input H,W.
+    """
+
+    def __init__(
+        self,
+        keys: Sequence[str],
+        out_size: Tuple[int, int],                 # (H_out, W_out)
+        prob: float = 1.0,
+        zoom_range: Tuple[float, float] = (0.8, 1.2),
+        angle_range: Tuple[float, float] = (-15.0, 15.0),  # degrees by default
+        degrees: bool = True,
+        translate: Tuple[float, float] = (0.0, 0.0),       # normalized coords
+        padding_mode: str = "zeros",
+        align_corners: bool = False,
+        mode_map: Optional[Dict[str, str]] = None,         # {"img":"bilinear","seg":"nearest"}
+    ):
+        self.keys = list(keys)
+        self.out_size = tuple(out_size)
+        self.prob = prob
+        self.zoom_range = zoom_range
+        self.angle_range = angle_range
+        self.degrees = degrees
+        self.translate = translate
+        self.padding_mode = padding_mode
+        self.align_corners = align_corners
+        self.mode_map = mode_map or {}
+
+    @staticmethod
+    def _ensure_bchw(x: torch.Tensor):
+        if x.ndim == 3:
+            return x.unsqueeze(0), True
+        if x.ndim == 4:
+            return x, False
+        raise ValueError(f"Expected (C,H,W) or (B,C,H,W), got {tuple(x.shape)}")
+
+    def _sample_params(self, device, dtype):
+        if torch.rand(1, device=device).item() >= self.prob:
+            return 1.0, 0.0, 0.0, 0.0
+
+        z0, z1 = self.zoom_range
+        if z0 > z1:
+            z0, z1 = z1, z0
+        zoom = torch.empty(1, device=device, dtype=dtype).uniform_(z0, z1).item()
+
+        a0, a1 = self.angle_range
+        if a0 > a1:
+            a0, a1 = a1, a0
+        angle = torch.empty(1, device=device, dtype=dtype).uniform_(a0, a1).item()
+        if self.degrees:
+            angle = math.radians(angle)
+
+        tx_max, ty_max = self.translate
+        tx = torch.empty(1, device=device, dtype=dtype).uniform_(-tx_max, tx_max).item() if tx_max > 0 else 0.0
+        ty = torch.empty(1, device=device, dtype=dtype).uniform_(-ty_max, ty_max).item() if ty_max > 0 else 0.0
+
+        return zoom, angle, tx, ty
+
+    def _build_theta(self, B, zoom, angle, tx, ty, device, dtype):
+        """
+        affine_grid maps output -> input coordinates.
+        Zoom-in (zoom > 1) => scale = 1 / zoom.
+        """
+        s = 1.0 / zoom
+        ca, sa = math.cos(angle), math.sin(angle)
+
+        theta = torch.tensor(
+            [[s * ca, -s * sa, tx],
+             [s * sa,  s * ca, ty]],
+            device=device,
+            dtype=dtype,
+        ).unsqueeze(0).expand(B, -1, -1)
+
+        return theta
+
+    def __call__(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(data)
+
+        # reference tensor
+        ref = None
+        for k in self.keys:
+            if k in out:
+                ref = out[k]
+                break
+        if ref is None:
+            return out
+
+        ref, _ = self._ensure_bchw(ref)
+        B, _, H_in, W_in = ref.shape
+        H_out, W_out = self.out_size
+        device, dtype = ref.device, ref.dtype
+
+        zoom, angle, tx, ty = self._sample_params(device, dtype)
+        theta = self._build_theta(B, zoom, angle, tx, ty, device, dtype)
+
+        # ONE grid
+        grid = F.affine_grid(
+            theta,
+            size=(B, 1, H_out, W_out),
+            align_corners=self.align_corners,
+        )
+
+        for k in self.keys:
+            if k not in out:
+                continue
+
+            x, added_batch = self._ensure_bchw(out[k])
+            if x.shape[-2:] != (H_in, W_in):
+                raise ValueError(
+                    f"All keys must share same H,W. Key '{k}' has {tuple(x.shape[-2:])}, ref {(H_in,W_in)}."
+                )
+
+            mode = self.mode_map.get(k, "bilinear")
+            y = F.grid_sample(
+                x,
+                grid,
+                mode=mode,
+                padding_mode=self.padding_mode,
+                align_corners=self.align_corners,
+            )
+
+            out[k] = y.squeeze(0) if added_batch else y
+
+        return out
+
+
+class ResizeIfNeededInterpolateTorch:
+    """
+    Dict-style resize using F.interpolate, only if size != target.
+
+    - Supports (B,C,H,W) or (C,H,W).
+    - Expects all keys share the same input H,W.
+    - Uses per-key interpolation mode via mode_map (e.g., img=bilinear, seg=nearest).
+    """
+
+    def __init__(
+        self,
+        keys: Sequence[str],
+        out_size: Tuple[int, int],                  # (H_out, W_out)
+        align_corners: bool = False,
+        mode_map: Optional[Dict[str, str]] = None,  # {"img":"bilinear","seg":"nearest"}
+        antialias_map: Optional[Dict[str, bool]] = None,  # {"img": True}
+    ):
+        self.keys = list(keys)
+        self.out_size = tuple(out_size)
+        self.align_corners = align_corners
+        self.mode_map = mode_map or {}
+        self.antialias_map = antialias_map or {}
+
+    @staticmethod
+    def _ensure_bchw(x: torch.Tensor):
+        if x.ndim == 3:
+            return x.unsqueeze(0), True
+        if x.ndim == 4:
+            return x, False
+        raise ValueError(f"Expected (C,H,W) or (B,C,H,W), got {tuple(x.shape)}")
+
+    def __call__(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(data)
+
+        ref_key = next((k for k in self.keys if k in out), None)
+        if ref_key is None:
+            return out
+
+        ref, _ = self._ensure_bchw(out[ref_key])
+        _, _, H_in, W_in = ref.shape
+        H_out, W_out = self.out_size
+
+        # no-op if already correct size
+        if (H_in, W_in) == (H_out, W_out):
+            return out
+
+        for k in self.keys:
+            if k not in out:
+                continue
+
+            x, added_batch = self._ensure_bchw(out[k])
+
+            if x.shape[-2:] != (H_in, W_in):
+                raise ValueError(
+                    f"All keys must share same input H,W. Key '{k}' has {tuple(x.shape[-2:])}, ref {(H_in, W_in)}."
+                )
+
+            mode = self.mode_map.get(k, "bilinear")
+            antialias = self.antialias_map.get(k, False)
+
+            # interpolate expects floating point for most modes; nearest works with ints too,
+            # but we keep it safe and explicit.
+            orig_dtype = x.dtype
+            needs_float = mode in ("bilinear", "bicubic", "trilinear", "area")
+            if needs_float and not torch.is_floating_point(x):
+                x = x.float()
+
+            if mode in ("bilinear", "bicubic", "trilinear"):
+                y = F.interpolate(
+                    x, size=(H_out, W_out), mode=mode,
+                    align_corners=self.align_corners,
+                    antialias=antialias,
+                )
+            else:
+                # nearest / area etc don't take align_corners
+                y = F.interpolate(
+                    x, size=(H_out, W_out), mode=mode,
+                    antialias=antialias,
+                )
+
+            # for seg: if you want int labels back
+            if not torch.is_floating_point(out[k]) and torch.is_floating_point(y):
+                # only happens if input was int but we casted (shouldn't for nearest)
+                y = y.to(orig_dtype)
+
+            out[k] = y.squeeze(0) if added_batch else y
+
+        return out
 
 class TrainTransformsSeg:
     def __init__(self):
@@ -883,12 +1430,9 @@ class TrainTransformsSeg:
             [
                 EnsureChannelFirstd(strict_check=False, keys=["img"], channel_dim=2),
                 EnsureChannelFirstd(strict_check=False, keys=["seg"], channel_dim='no_channel'),
-                LabelMapCrop(img_key="img", seg_key="seg", prob=0.5),
-                RandZoomd(keys= ["img", "seg"], prob=0.4, min_zoom=0.2, max_zoom=1.5, mode=["area", "nearest"], padding_mode='constant'),
-                Resized(keys=["img", "seg"], spatial_size=[512, 512], mode=['area', 'nearest']),
-                RandFlipd(keys=["img", "seg"], prob=0.2, spatial_axis=1),
-                RandRotated(keys=["img", "seg"], prob=0.2, range_x=math.pi/2.0, range_y=math.pi/2.0, mode=["bilinear", "nearest"], padding_mode='zeros'),
-                ScaleIntensityd(keys=["img"]),                
+                RandZoomRotateResizedGridTorch(keys=["img", "seg"], out_size=(512, 512), prob=0.8, zoom_range=(0.2, 1.5), angle_range=(-90, 90), mode_map={"img": "bilinear", "seg": "nearest"}, padding_mode="border",),
+                ResizeIfNeededInterpolateTorch(keys=["img", "seg"], out_size=(512, 512), mode_map={"img": "bilinear", "seg": "nearest"}, antialias_map={"img": True}),
+                ScaleIntensityd(keys=["img"]),
                 Lambdad(keys=['img'], func=lambda x: color_jitter(x))
             ]
         )
@@ -1062,3 +1606,76 @@ class BBXImageTestTransform():
     def __call__(self, image, bboxes, category_ids, mask=None):
         return self.transform(image=image, bboxes=bboxes, category_ids=category_ids, mask=mask)
     
+
+class TTDatasetSegPkl(Dataset):
+    def __init__(self, df, mount_point="./", transform=monai.transforms.Identityd(keys=["img", "seg"])):
+        self.df = df.reset_index(drop=True)
+        self.mount_point = mount_point
+        self.transform = transform        
+
+        self.buffer = []
+
+        for idx in range(len(self.df)):
+            row = self.df.iloc[idx]
+            img_path = os.path.join(self.mount_point, row["img"])
+            
+            with open(img_path, 'rb') as f:
+                img_seg = pickle.load(f)
+
+            self.buffer.append(img_seg)
+        
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        sample = self.buffer[idx]
+        sample['img'] = sample['img'].float()/255.0
+        sample['seg'] = sample['seg'].float()
+
+        return self.transform(sample)
+
+
+class TTDataModuleSegPkl(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers        
+        self.drop_last=True
+        cj = transforms.ColorJitter(brightness=[.8, 1.2], contrast=[0.8, 1.2], saturation=[.8, 1.2], hue=[-.1, .1])
+        self.train_transform = transforms.Compose([
+            ScaleIntensityd(keys=["img"]),
+            Lambdad(keys=['img'], func=lambda x: cj(x)),            
+        ])        
+        self.val_transform = ScaleIntensityd(keys=["img"])
+        self.test_transform = ScaleIntensityd(keys=["img"])
+
+    def setup(self, stage=None):
+
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = monai.data.Dataset(data=TTDatasetSegPkl(self.df_train, mount_point=self.mount_point, transform=self.train_transform))
+
+        self.val_ds = monai.data.Dataset(TTDatasetSegPkl(self.df_val, mount_point=self.mount_point, transform=self.val_transform))
+        self.test_ds = monai.data.Dataset(TTDatasetSegPkl(self.df_test, mount_point=self.mount_point, transform=self.test_transform))
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, 
+                          drop_last=self.drop_last, 
+                          shuffle=True,
+                          prefetch_factor=2,
+                          pin_memory=True,
+                          persistent_workers=True,)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, 
+                                                                    # collate_fn=classification_collate_fn,
+                                                                    collate_fn=pad_list_data_collate,
+                                                                    )
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
