@@ -455,6 +455,84 @@ class TTUNet(pl.LightningModule):
     def predict_step(self, images):
         return torch.argmax(self(images), dim=1, keepdim=True)
 
+
+class TTUNet(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super(TTUNet, self).__init__()        
+        
+        self.save_hyperparameters()
+
+        if hasattr(self.hparams, "ce_weight") and self.hparams.ce_weight is not None:
+            self.loss = monai.losses.DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, ce_weight=torch.tensor(self.hparams.ce_weight), lambda_dice=1.0, lambda_ce=1.0)
+        else:
+            self.loss = monai.losses.DiceLoss(include_background=False, softmax=True, to_onehot_y=True)
+        
+
+        self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=self.hparams.out_channels)
+
+        self.model = monai.networks.nets.UNet(spatial_dims=2, in_channels=3, out_channels=self.hparams.out_channels, channels=(16, 32, 64, 128, 256, 512, 1024), strides=(2, 2, 2, 2, 2, 2), num_res_units=4)
+        # self.metric = DiceMetric(include_background=True, reduction="mean") 
+         
+        self.train_transform = monai.transforms.Compose([
+            RandZoomRotateResizedGridTorch(keys=["img", "seg"], out_size=(512, 512), prob=0.9, zoom_range=(0.2, 1.5), angle_range=(-90, 90), mode_map={"img": "bilinear", "seg": "nearest"}, padding_mode="border",),
+                ResizeIfNeededInterpolateTorch(keys=["img", "seg"], out_size=(512, 512), mode_map={"img": "bilinear", "seg": "nearest"}, antialias_map={"img": True}),
+        ])  
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return optimizer
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, train_batch, batch_idx):
+        
+        train_batch = self.train_transform(train_batch)
+        
+        x = train_batch["img"]
+        y = train_batch["seg"]
+        
+        y = y.to(torch.int64)
+        x = self.model(x)
+
+        loss = self.loss(x, y)
+        
+        batch_size = x.shape[0]
+        self.log('train_loss', loss, batch_size=batch_size)        
+
+        # x = torch.argmax(x, dim=1, keepdim=True)
+        
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch["img"]
+        y = val_batch["seg"]
+        
+        y = y.to(torch.int64)
+        x = self.model(x)
+        
+        loss = self.loss(x, y)
+        
+        batch_size = x.shape[0]
+        self.log('val_loss', loss, batch_size=batch_size, sync_dist=True)
+
+    def test_step(self, test_batch, batch_idx):
+        x = test_batch["img"]
+        y = test_batch["seg"]
+        
+        y = y.to(torch.int64)
+        x = self.model(x)
+        
+        loss = self.loss(x, y)
+        
+        batch_size = x.shape[0]
+        self.log('test_loss', loss, batch_size=batch_size)
+        # x = torch.argmax(x, dim=1, keepdim=True)
+
+    def predict_step(self, images):
+        return torch.argmax(self(images), dim=1, keepdim=True)
+
+
 class TTRCNN(pl.LightningModule):
     def __init__(self, device='cuda', **kwargs):
         super(TTRCNN, self).__init__()        
