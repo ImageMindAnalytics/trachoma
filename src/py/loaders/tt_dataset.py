@@ -1910,12 +1910,12 @@ class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
         self.num_workers = num_workers
         self.drop_last = True
 
-        cj = transforms.ColorJitter(
-            brightness=[.8, 1.2],
-            contrast=[0.8, 1.2],
-            saturation=[.8, 1.2],
-            hue=[-.1, .1],
-        )
+        # cj = transforms.ColorJitter(
+        #     brightness=[.8, 1.2],
+        #     contrast=[0.8, 1.2],
+        #     saturation=[.8, 1.2],
+        #     hue=[-.1, .1],
+        # )
 
         # train: light CPU transform only
         # img: [1, 3, H, W] -> [3, H, W]
@@ -1924,7 +1924,7 @@ class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
             Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
             Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
             ScaleIntensityd(keys=["img"]),
-            Lambdad(keys=["img"], func=lambda x: cj(x)),
+            # Lambdad(keys=["img"], func=lambda x: cj(x)),
         ])
 
         # val/test: deterministic fixed size
