@@ -141,17 +141,23 @@ def main(args):
         cl_report_arr.append(cl_report)
         print(cl_report)
 
-        jaccard = jaccard_score(
-            y_true,
-            y_pred,
-            labels=labels,
-            average=None,
-            zero_division=0,
-        )
+        dice = np.full(args.num_classes, np.nan)
 
-        dice = 2.0 * jaccard / (1.0 + jaccard)
+        for c in labels:
+            true_c = (y_true == c)
+            pred_c = (y_pred == c)
+        
+            true_sum = true_c.sum()
+            pred_sum = pred_c.sum()
+        
+            # no class i in both GT and prediction: do not count
+            if true_sum == 0 and pred_sum == 0:
+                dice[c] = np.nan
+            else:
+                intersection = np.logical_and(true_c, pred_c).sum()
+                dice[c] = 2.0 * intersection / (true_sum + pred_sum)
+        
         print(dice)
-
         dice_arr.append(dice)
 
     out_base = os.path.splitext(args.csv)[0]
@@ -166,15 +172,16 @@ def main(args):
     )
 
     dice_arr = np.array(dice_arr)
+    dice_arr_plot = pd.DataFrame(dice_arr, columns=[f"class_{i}" for i in labels])
     print(dice_arr.shape)
 
     np.save(out_base + "_violin_plot.npy", dice_arr)
 
     fig3 = plt.figure(figsize=(8, 5))
     try:
-        s = sns.violinplot(data=dice_arr, cut=0, density_norm="count")
+        s = sns.violinplot(data=dice_arr_plot, cut=0, density_norm="count")
     except TypeError:
-        s = sns.violinplot(data=dice_arr, cut=0, scale="count")
+        s = sns.violinplot(data=dice_arr_plot, cut=0, scale="count")
 
     s.set_title("Dice coefficients")
     s.set_xlabel("Class")

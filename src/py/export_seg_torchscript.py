@@ -1,23 +1,52 @@
+import os
+import argparse
+
 import torch
+
 from nets.segmentation import TTUNet
 
-CKPT = "/home/yin816/tt_training/output/seg_run_gpu_trans_dicece_sqrt/epoch=16-val_loss=1.53.ckpt"
 
-model = TTUNet.load_from_checkpoint(
-    CKPT,
-    out_channels=7,
-)
+def main(args):
 
-model.eval()
-model.cpu()
+    model = TTUNet.load_from_checkpoint(
+        args.ckpt,
+        out_channels=args.out_channels,
+    )
 
-example_input = torch.randn(1, 3, 512, 512)
+    model.eval()
+    model.cpu()
 
-traced = torch.jit.trace(model.model, example_input)
+    example_input = torch.randn(1, 3, 512, 512)
 
-torch.jit.save(
-    traced,
-    "/home/yin816/tt_training/output/seg_run_gpu_trans_dicece_sqrt/model_nocj_epoch=16-val_loss=1.53.ts"
-)
+    traced = torch.jit.trace(model.model, example_input)
 
-print("saved")
+    out_ts = os.path.splitext(args.ckpt)[0] + ".ts"
+
+    torch.jit.save(
+        traced,
+        out_ts
+    )
+
+    print("saved:", out_ts)
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        required=True,
+        help="path to checkpoint"
+    )
+
+    parser.add_argument(
+        "--out_channels",
+        type=int,
+        default=7,
+    )
+
+    args = parser.parse_args()
+
+    main(args)
