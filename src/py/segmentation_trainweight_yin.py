@@ -52,12 +52,8 @@ def main(args):
     
 
 
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=args.out,
-        filename='{epoch}-{val_loss:.2f}',
-        save_top_k=2,
-        monitor='val_loss'
-    )
+    checkpoint_callback = ModelCheckpoint(dirpath=args.out, filename='{epoch}-{val_loss:.2f}', save_top_k=2, monitor='val_loss' )
+    checkpoint_callback = ModelCheckpoint(dirpath=args.out, filename='{epoch}-{val_rare_dice:.4f}', save_top_k=2, monitor='val_rare_dice', mode='max')
     
     # image_logger = MaskRCNNImageLoggerNeptune(log_steps = args.log_every_n_steps)
     
@@ -87,7 +83,9 @@ def main(args):
     # model.load_state_dict(model_dict)
     
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=args.patience, verbose=True, mode="min")
+    # early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=args.patience, verbose=True, mode="min")
+    early_stop_callback = EarlyStopping(monitor="val_rare_dice", min_delta=0.00, patience=args.patience, verbose=True, mode="max")
+    
     logger = None
     
     callbacks = [early_stop_callback, checkpoint_callback]

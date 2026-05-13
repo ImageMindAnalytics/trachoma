@@ -379,81 +379,6 @@ class ResizeIfNeededInterpolateTorch:
         return out
     
 
-class TTUNet(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super(TTUNet, self).__init__()        
-        
-        self.save_hyperparameters()
-
-        if hasattr(self.hparams, "ce_weight") and self.hparams.ce_weight is not None:
-            self.loss = monai.losses.DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, weight=torch.tensor(self.hparams.ce_weight), lambda_dice=1.0, lambda_ce=1.0)
-        else:
-            self.loss = monai.losses.DiceLoss(include_background=False, softmax=True, to_onehot_y=True)
-        
-
-        self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=self.hparams.out_channels)
-
-        self.model = monai.networks.nets.UNet(spatial_dims=2, in_channels=3, out_channels=self.hparams.out_channels, channels=(16, 32, 64, 128, 256, 512, 1024), strides=(2, 2, 2, 2, 2, 2), num_res_units=4)
-        # self.metric = DiceMetric(include_background=True, reduction="mean") 
-         
-        self.train_transform = monai.transforms.Compose([
-            RandZoomRotateResizedGridTorch(keys=["img", "seg"], out_size=(512, 512), prob=0.9, zoom_range=(0.2, 1.5), angle_range=(-90, 90), mode_map={"img": "bilinear", "seg": "nearest"}, padding_mode="border",),
-                ResizeIfNeededInterpolateTorch(keys=["img", "seg"], out_size=(512, 512), mode_map={"img": "bilinear", "seg": "nearest"}, antialias_map={"img": True}),
-        ])  
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
-        return optimizer
-
-    def forward(self, x):
-        return self.model(x)
-
-    def training_step(self, train_batch, batch_idx):
-        
-        train_batch = self.train_transform(train_batch)
-        
-        x = train_batch["img"]
-        y = train_batch["seg"]
-        
-        y = y.to(torch.int64)
-        x = self.model(x)
-
-        loss = self.loss(x, y)
-        
-        batch_size = x.shape[0]
-        self.log('train_loss', loss, batch_size=batch_size)        
-
-        # x = torch.argmax(x, dim=1, keepdim=True)
-        
-        return loss
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch["img"]
-        y = val_batch["seg"]
-        
-        y = y.to(torch.int64)
-        x = self.model(x)
-        
-        loss = self.loss(x, y)
-        
-        batch_size = x.shape[0]
-        self.log('val_loss', loss, batch_size=batch_size, sync_dist=True)
-
-    def test_step(self, test_batch, batch_idx):
-        x = test_batch["img"]
-        y = test_batch["seg"]
-        
-        y = y.to(torch.int64)
-        x = self.model(x)
-        
-        loss = self.loss(x, y)
-        
-        batch_size = x.shape[0]
-        self.log('test_loss', loss, batch_size=batch_size)
-        # x = torch.argmax(x, dim=1, keepdim=True)
-
-    def predict_step(self, images):
-        return torch.argmax(self(images), dim=1, keepdim=True)
 
 
 class TTUNet(pl.LightningModule):
@@ -477,6 +402,10 @@ class TTUNet(pl.LightningModule):
             RandZoomRotateResizedGridTorch(keys=["img", "seg"], out_size=(512, 512), prob=0.9, zoom_range=(0.2, 1.5), angle_range=(-90, 90), mode_map={"img": "bilinear", "seg": "nearest"}, padding_mode="border",),
                 ResizeIfNeededInterpolateTorch(keys=["img", "seg"], out_size=(512, 512), mode_map={"img": "bilinear", "seg": "nearest"}, antialias_map={"img": True}),
         ])  
+        # needed for rare-class-only based score
+        self.rare_classes = [2, 3, 4, 5, 6]
+        self.val_rare_intersections = []
+        self.val_rare_denominators = []
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
@@ -509,12 +438,53 @@ class TTUNet(pl.LightningModule):
         y = val_batch["seg"]
         
         y = y.to(torch.int64)
-        x = self.model(x)
+        logits = self.model(x)
+    
+        loss = self.loss(logits, y)
         
-        loss = self.loss(x, y)
-        
-        batch_size = x.shape[0]
+        batch_size = logits.shape[0]
         self.log('val_loss', loss, batch_size=batch_size, sync_dist=True)
+        
+        # rare-class based score & whole validation dataset
+    
+        pred = torch.argmax(logits, dim=1)  # [B, H, W]
+        true = y.squeeze(1) if y.ndim == 4 else y  # [B, H, W]
+    
+        intersections = []
+        denominators = []
+    
+        for c in self.rare_classes:
+            pred_c = pred == c
+            true_c = true == c
+    
+            intersections.append((pred_c & true_c).sum().float())
+            denominators.append(pred_c.sum().float() + true_c.sum().float())
+    
+        self.val_rare_intersections.append(torch.stack(intersections))
+        self.val_rare_denominators.append(torch.stack(denominators))
+    
+    def on_validation_epoch_end(self):
+        if len(self.val_rare_intersections) == 0:
+            return
+    
+        intersections = torch.stack(self.val_rare_intersections).sum(dim=0)
+        denominators = torch.stack(self.val_rare_denominators).sum(dim=0)
+    
+        dice_per_class = torch.where(
+            denominators > 0,
+            2.0 * intersections / denominators,
+            torch.zeros_like(denominators),
+        )
+    
+        val_rare_dice = dice_per_class.mean()
+    
+        self.log("val_rare_dice", val_rare_dice, prog_bar=True, sync_dist=True)
+    
+        for i, c in enumerate(self.rare_classes):
+            self.log( f"val_dice_class_{c}", dice_per_class[i], prog_bar=False, sync_dist=True)
+    
+        self.val_rare_intersections.clear()
+        self.val_rare_denominators.clear()
 
     def test_step(self, test_batch, batch_idx):
         x = test_batch["img"]
