@@ -1605,7 +1605,7 @@ class BBXImageTestTransform():
 
     def __call__(self, image, bboxes, category_ids, mask=None):
         return self.transform(image=image, bboxes=bboxes, category_ids=category_ids, mask=mask)
-    
+
 
 class TTDatasetSegPkl(Dataset):
     def __init__(self, df, mount_point="./", transform=monai.transforms.Identityd(keys=["img", "seg"])):
@@ -1635,7 +1635,8 @@ class TTDatasetSegPkl(Dataset):
 
         return self.transform(sample)
 
-
+        
+        
 class TTDataModuleSegPkl(pl.LightningDataModule):
     def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4):
         super().__init__()
@@ -1679,3 +1680,325 @@ class TTDataModuleSegPkl(pl.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
+        
+# no GPU for transform       
+class TTDataModuleSegPklTrans(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.drop_last = True
+
+        cj = transforms.ColorJitter(
+            brightness=[.8, 1.2],
+            contrast=[0.8, 1.2],
+            saturation=[.8, 1.2],
+            hue=[-.1, .1],
+        )
+
+        self.train_transform = Compose([
+            # pkl: img [1, 3, H, W] -> [3, H, W]
+            Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
+
+            # pkl: seg [1, H, W] should stay [1, H, W]
+            # do NOT squeeze to [H, W], otherwise spatial transform may misread H as channel/depth
+            Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
+
+            RandZoomRotateResizedGridTorch(
+                keys=["img", "seg"],
+                out_size=(512, 512),
+                prob=0.8,
+                zoom_range=(0.2, 1.5),
+                angle_range=(-90, 90),
+                mode_map={"img": "bilinear", "seg": "nearest"},
+                padding_mode="border",
+            ),
+
+            ResizeIfNeededInterpolateTorch(
+                keys=["img", "seg"],
+                out_size=(512, 512),
+                mode_map={"img": "bilinear", "seg": "nearest"},
+                antialias_map={"img": True},
+            ),
+
+            ScaleIntensityd(keys=["img"]),
+            Lambdad(keys=["img"], func=lambda x: cj(x)),
+        ])
+
+        self.val_transform = Compose([
+            Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
+            Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
+            Resized(keys=["img", "seg"], spatial_size=[512, 512], mode=["area", "nearest"]),
+            ScaleIntensityd(keys=["img"]),
+        ])
+
+        self.test_transform = Compose([
+            Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
+            Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
+            Resized(keys=["img", "seg"], spatial_size=[512, 512], mode=["area", "nearest"]),
+            ScaleIntensityd(keys=["img"]),
+        ])
+
+    def setup(self, stage=None):
+        self.train_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(self.df_train, mount_point=self.mount_point),
+            transform=self.train_transform,
+        )
+
+        self.val_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(self.df_val, mount_point=self.mount_point),
+            transform=self.val_transform,
+        )
+
+        self.test_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(self.df_test, mount_point=self.mount_point),
+            transform=self.test_transform,
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            shuffle=True,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+            collate_fn=pad_list_data_collate,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            collate_fn=pad_list_data_collate,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            collate_fn=pad_list_data_collate,
+        )
+
+class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=1, num_workers=4):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.drop_last = True
+
+        cj = transforms.ColorJitter(
+            brightness=[.8, 1.2],
+            contrast=[0.8, 1.2],
+            saturation=[.8, 1.2],
+            hue=[-.1, .1],
+        )
+
+        # train: light CPU transform only
+        # heavy random resize/rotation/zoom should be done in TTUNet.training_step on GPU
+        self.train_transform = Compose([
+            ScaleIntensityd(keys=["img"]),
+            Lambdad(keys=["img"], func=lambda x: cj(x)),
+        ])
+
+        # val/test: deterministic fixed size
+        self.val_transform = Compose([
+            Resized(
+                keys=["img", "seg"],
+                spatial_size=[512, 512],
+                mode=["area", "nearest"],
+            ),
+            ScaleIntensityd(keys=["img"]),
+        ])
+
+        self.test_transform = Compose([
+            Resized(
+                keys=["img", "seg"],
+                spatial_size=[512, 512],
+                mode=["area", "nearest"],
+            ),
+            ScaleIntensityd(keys=["img"]),
+        ])
+
+    def setup(self, stage=None):
+        self.train_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(
+                self.df_train,
+                mount_point=self.mount_point,
+                transform=self.train_transform,
+            )
+        )
+
+        self.val_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(
+                self.df_val,
+                mount_point=self.mount_point,
+                transform=self.val_transform,
+            )
+        )
+
+        self.test_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(
+                self.df_test,
+                mount_point=self.mount_point,
+                transform=self.test_transform,
+            )
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            shuffle=True,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            collate_fn=pad_list_data_collate,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            collate_fn=pad_list_data_collate,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+        
+# to use DiceCELoss
+class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=1, num_workers=4):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.drop_last = True
+
+        # cj = transforms.ColorJitter(
+        #     brightness=[.8, 1.2],
+        #     contrast=[0.8, 1.2],
+        #     saturation=[.8, 1.2],
+        #     hue=[-.1, .1],
+        # )
+
+        # train: light CPU transform only
+        # img: [1, 3, H, W] -> [3, H, W]
+        # seg: keep [1, H, W] for Dice/DiceCE loss
+        self.train_transform = Compose([
+            Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
+            Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
+            ScaleIntensityd(keys=["img"]),
+            # Lambdad(keys=["img"], func=lambda x: cj(x)),
+        ])
+
+        # val/test: deterministic fixed size
+        self.val_transform = Compose([
+            Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
+            Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
+            Resized(keys=["img", "seg"], spatial_size=[512, 512], mode=["area", "nearest"]),
+            ScaleIntensityd(keys=["img"]),
+        ])
+
+        self.test_transform = Compose([
+            Lambdad(keys=["img"], func=lambda x: x.squeeze(0) if x.ndim == 4 else x),
+            Lambdad(keys=["seg"], func=lambda x: x if x.ndim == 3 else x.unsqueeze(0)),
+            Resized(keys=["img", "seg"], spatial_size=[512, 512], mode=["area", "nearest"]),
+            ScaleIntensityd(keys=["img"]),
+        ])
+
+    def setup(self, stage=None):
+        self.train_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(
+                self.df_train,
+                mount_point=self.mount_point,
+                transform=self.train_transform,
+            )
+        )
+
+        self.val_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(
+                self.df_val,
+                mount_point=self.mount_point,
+                transform=self.val_transform,
+            )
+        )
+
+        self.test_ds = monai.data.Dataset(
+            data=TTDatasetSegPkl(
+                self.df_test,
+                mount_point=self.mount_point,
+                transform=self.test_transform,
+            )
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            shuffle=True,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            collate_fn=pad_list_data_collate,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.drop_last,
+            collate_fn=pad_list_data_collate,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )

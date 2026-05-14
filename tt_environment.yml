@@ -1,13 +1,10 @@
-name: tt
+name: tt_yin
 channels:
-  - Microsoft
   - defaults
 dependencies:
   - _libgcc_mutex=0.1
   - bzip2=1.0.8
-  - ca-certificates=2024.07.04
   - libffi=3.4.4
-  - openssl=3.3.1
   - python=3.10
   - sqlite=3.45.3
   - tk=8.6.14
