@@ -416,7 +416,7 @@ class TTUNet(pl.LightningModule):
         return parent_parser
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         return optimizer
 
     def forward(self, x):
@@ -509,6 +509,19 @@ class TTUNet(pl.LightningModule):
 
     def predict_step(self, images):
         return torch.argmax(self(images), dim=1, keepdim=True)
+
+    @staticmethod
+    def suggest_hyper_params(trial):
+        lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+        ce_weight = []
+        for i in range(5):
+            ce_weight.append(trial.suggest_float(f"ce_weight_{i}", 0.0, 1.0, log=True))
+        return {
+            "lr": lr,
+            "ce_weight": ce_weight,
+            "weight_decay": weight_decay,
+        }
 
 
 class TTRCNN(pl.LightningModule):
