@@ -1,152 +1,117 @@
-import os
-# os.environ['CUDA_VISIBLE_DEVICES']="0"
 import argparse
-
-import math
-import pandas as pd
-import numpy as np 
+import os
 
 import torch
-torch.set_float32_matmul_precision('medium')
 
-from nets.segmentation import TTUNet,TTRCNN
-from loaders.tt_dataset import TTDataModuleSeg, TrainTransformsSeg, EvalTransformsSeg, TTDataModuleSegPkl, TTDataModuleSegPklTrans, TTDataModuleSegPklGPUTrans
-from callbacks.logger import SegImageLoggerNeptune, MaskRCNNImageLoggerNeptune
+from loaders import tt_dataset
+from nets import segmentation
 
 from lightning import Trainer
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies.ddp import DDPStrategy
-from lightning.pytorch.loggers import NeptuneLogger
+from lightning.pytorch.loggers import MLFlowLogger
 
-from sklearn.utils import class_weight
+torch.set_float32_matmul_precision('medium')
+
+
+def add_train_args(parser):
+    """Add segmentation training argument groups to a parser. Returns the parser."""
+    hparams_group = parser.add_argument_group('Hyperparameters')
+    hparams_group.add_argument('--epochs', help='Max number of epochs', type=int, default=200)
+    hparams_group.add_argument('--patience', help='Max number of patience steps for EarlyStopping', type=int, default=30)
+    hparams_group.add_argument('--steps', help='Max number of steps per epoch', type=int, default=-1)
+    hparams_group.add_argument('--accumulate_grad_batches', help='Number of gradient accumulation steps', type=int, default=1)
+    hparams_group.add_argument('--find_unused_parameters', help='find_unused_parameters', type=int, default=0)
+
+    input_group = parser.add_argument_group('Input')
+    input_group.add_argument('--nn', help='Type of neural network', type=str, default='TTUNet')
+    input_group.add_argument('--model', help='Model to continue training', type=str, default=None)
+    input_group.add_argument('--data_module', help='Type of data module to use', type=str, default='TTDataModuleSegPklGPUTrans')
+
+    output_group = parser.add_argument_group('Output')
+    output_group.add_argument('--out', help='Output directory', type=str, default='./')
+    output_group.add_argument('--monitor', help='Metric to monitor to save checkpoints', type=str, default='val_loss')
+    output_group.add_argument('--monitor_mode', help='Monitor mode (min or max)', type=str, default='min')
+
+    log_group = parser.add_argument_group('Logger')
+    log_group.add_argument('--log_every_n_steps', help='Log every n steps', type=int, default=10)
+    log_group.add_argument('--mlflow_tags', help='MLFlow tags', type=str, nargs='+', default=None)
+    log_group.add_argument('--mlflow_experiment_name', help='MLFlow experiment name', type=str, default='trachoma/segmentation')
+    return parser
+
 
 def main(args):
 
-    # train_fn = os.path.join(args.mount_point, 'Analysis_Set_202208', 'trachoma_bsl_mtss_besrat_field_seg_train_202208_train.csv')
-    # valid_fn = os.path.join(args.mount_point, 'Analysis_Set_202208', 'trachoma_bsl_mtss_besrat_field_seg_train_202208_eval.csv')
-    # test_fn = os.path.join(args.mount_point, 'Analysis_Set_202208', 'trachoma_bsl_mtss_besrat_field_seg_test_202208.csv')
+    if args.out and not os.path.exists(args.out):
+        os.makedirs(args.out)
 
-    df_train = pd.read_csv(args.csv_train)
-    df_val = pd.read_csv(args.csv_valid)
-    df_test = pd.read_csv(args.csv_test)
-    
-
-    # if args.data_module == 'pkl':
-    #     ttdata = TTDataModuleSegPkl(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, mount_point=args.mount_point)
-        
-    # if args.data_module == 'pkl':
-    #    ttdata = TTDataModuleSegPklTrans(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, mount_point=args.mount_point)
-    
-    if args.data_module == 'pkl':
-      ttdata = TTDataModuleSegPklGPUTrans(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, mount_point=args.mount_point)
-
+    NN = getattr(segmentation, args.nn)
+    if args.model:
+        model = NN.load_from_checkpoint(args.model, strict=False, **vars(args))
     else:
-        train_transform = TrainTransformsSeg()
-        eval_transform = EvalTransformsSeg()
-        ttdata = TTDataModuleSeg(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, seg_column=args.seg_column, mount_point=args.mount_point, train_transform=train_transform, valid_transform=eval_transform, test_transform=eval_transform)
-    
-    
+        model = NN(**vars(args))
 
+    DM = getattr(tt_dataset, args.data_module)
+    datamodule = DM(**vars(args))
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.out,
-        filename='{epoch}-{val_loss:.2f}',
+        filename='{epoch}-{' + args.monitor + ':.2f}',
         save_top_k=2,
-        monitor='val_loss'
+        monitor=args.monitor,
+        mode=args.monitor_mode,
+        save_last=True,
     )
-    
-    # image_logger = MaskRCNNImageLoggerNeptune(log_steps = args.log_every_n_steps)
-    
-    if args.model:
-        model = TTUNet.load_from_checkpoint(args.model, out_channels=2, **vars(args), strict=False)
-        # model = TTRCNN.load_from_checkpoint(args.model, out_channels=4, **vars(args), strict=False)
-    else:
-        model = TTUNet(**vars(args))
-        # model = TTRCNN(num_classes=4,  **vars(args))
-    
 
-    # ckpt = '/CMF/data/lumargot/trachoma/output/segmentation/first_model/epoch.192-val_loss.0.52.ckpt'
-    # checkpoint = torch.load(ckpt, map_location="cpu")
+    early_stop_callback = EarlyStopping(
+        monitor=args.monitor,
+        min_delta=0.00,
+        patience=args.patience,
+        verbose=True,
+        mode=args.monitor_mode,
+    )
 
-    # state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-    # model_dict = model.state_dict()
-
-    # pretrained_dict = {
-    #     k: v for k, v in state_dict.items()
-    #     if k in model_dict and v.shape == model_dict[k].shape
-    # }
-
-    # print(f"Loaded {len(pretrained_dict)} / {len(model_dict)} layers")
-
-    # # Update and load
-    # model_dict.update(pretrained_dict)
-    # model.load_state_dict(model_dict)
-    
-
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=args.patience, verbose=True, mode="min")
-    logger = None
-    
     callbacks = [early_stop_callback, checkpoint_callback]
-    if args.neptune_tags:
-        logger = NeptuneLogger(project='ImageMindAnalytics/trachoma',
-                               tags=args.neptune_tags,
-                               api_key=os.environ['NEPTUNE_API_TOKEN'],
-                               log_model_checkpoints=False)
 
-        image_logger = SegImageLoggerNeptune(num_images=4, nrow=2, log_steps=args.log_every_n_steps)
-        callbacks.append(image_logger)
+    if args.mlflow_tags:
+        logger_mlflow = MLFlowLogger(
+            experiment_name=args.mlflow_experiment_name,
+            tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+            tags={str(i): tag for i, tag in enumerate(args.mlflow_tags)},
+        )
+    else:
+        logger_mlflow = None
 
     trainer = Trainer(
-        logger=logger,
+        logger=logger_mlflow,
         max_epochs=args.epochs,
+        max_steps=args.steps,
         callbacks=callbacks,
-        devices=torch.cuda.device_count(), 
-        accelerator="gpu", 
-        strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else 'auto',
-        log_every_n_steps=args.log_every_n_steps, 
-        accumulate_grad_batches=args.accumulate_grad_batches
+        devices=torch.cuda.device_count(),
+        accelerator='gpu',
+        strategy=DDPStrategy(find_unused_parameters=bool(args.find_unused_parameters)) if torch.cuda.device_count() > 1 else 'auto',
+        log_every_n_steps=args.log_every_n_steps,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
-    trainer.fit(model, datamodule=ttdata, ckpt_path=args.model)
-    trainer.test(model, datamodule=ttdata)
+
+    trainer.fit(model, datamodule=datamodule, ckpt_path=args.model)
+    trainer.test(model, datamodule=datamodule)
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='TT segmentation Training', add_help=False)
+    add_train_args(parser)
 
+    args, unknownargs = parser.parse_known_args()
 
-    parser = argparse.ArgumentParser(description='TT segmentation Training')
+    NN = getattr(segmentation, args.nn)
+    NN.add_model_specific_args(parser)
 
-    input_group = parser.add_argument_group('Input')
-    input_group.add_argument('--data_module', help='Data module to use', type=str, default="tt", choices=["pkl","tt"])
-    input_group.add_argument('--model', help='Model to continue training', type=str, default= None)
-    input_group.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")    
-    input_group.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
-    input_group.add_argument('--csv_train', required=True, type=str, help='Train CSV')
-    input_group.add_argument('--csv_valid', required=True, type=str, help='Valid CSV')
-    input_group.add_argument('--csv_test', required=True, type=str, help='Test CSV')
-    input_group.add_argument('--img_column', type=str, default="img_path", help='Name of image column in csv')
-    input_group.add_argument('--seg_column', type=str, default="seg_path", help='Name of segmentation column in csv')
+    data_module = getattr(tt_dataset, args.data_module)
+    parser = data_module.add_data_specific_args(parser)
 
-    hparams_group = parser.add_argument_group('Hyperparameters')
-    hparams_group.add_argument('--lr', '--learning-rate', default=1e-4, type=float, help='Learning rate')
-    hparams_group.add_argument('--epochs', help='Max number of epochs', type=int, default=200)
-    hparams_group.add_argument('--patience', help='Max number of patience steps for EarlyStopping', type=int, default=30)
-    hparams_group.add_argument('--steps', help='Max number of steps per epoch', type=int, default=-1)    
-    hparams_group.add_argument('--batch_size', help='Batch size', type=int, default=256)
-    hparams_group.add_argument('--out_channels', help='Number of output channels', type=int, default=4)
-    hparams_group.add_argument('--ce_weight', help='Cross entropy weight', type=float, default=None, nargs='+')
-    hparams_group.add_argument('--accumulate_grad_batches', help='Number of gradient accumulation steps', type=int, default=1) 
-    
-    logger_group = parser.add_argument_group('Logger')
-    logger_group.add_argument('--log_every_n_steps', help='Log every n steps', type=int, default=10)
-    logger_group.add_argument('--tb_dir', help='Tensorboard output dir', type=str, default=None)
-    logger_group.add_argument('--tb_name', help='Tensorboard experiment name', type=str, default="segmentation_unet")
-    
-    logger_group.add_argument('--neptune_tags', help='neptune tag', type=str, nargs='+', default=None)
-
-    output_group = parser.add_argument_group('Output')
-    output_group.add_argument('--out', help='Output', type=str, default="./")
-
+    parser = argparse.ArgumentParser(parents=[parser])
     args = parser.parse_args()
 
     main(args)

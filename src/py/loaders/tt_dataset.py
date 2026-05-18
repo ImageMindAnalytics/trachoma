@@ -1621,6 +1621,8 @@ class TTDatasetSegPkl(Dataset):
             
             with open(img_path, 'rb') as f:
                 img_seg = pickle.load(f)
+                img_seg['img'] = img_seg['img'].squeeze(0) if img_seg['img'].ndim == 4 else img_seg['img']
+                img_seg['seg'] = img_seg['seg'].squeeze(0) if img_seg['seg'].ndim == 4 else img_seg['seg']
 
             self.buffer.append(img_seg)
         
@@ -1792,16 +1794,21 @@ class TTDataModuleSegPklTrans(pl.LightningDataModule):
         )
 
 class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
-    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=1, num_workers=4):
+    def __init__(
+        self,
+        *args, **kwargs,
+    ):
         super().__init__()
+        self.save_hyperparameters(logger=False)
 
-        self.df_train = df_train
-        self.df_val = df_val
-        self.df_test = df_test
-        self.mount_point = mount_point
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.drop_last = True
+        if os.path.splitext(self.hparams.csv_train)[1] == ".csv":
+            self.df_train = pd.read_csv(self.hparams.csv_train)
+            self.df_valid = pd.read_csv(self.hparams.csv_valid)
+            self.df_test = pd.read_csv(self.hparams.csv_test)
+        else:
+            self.df_train = pd.read_parquet(self.hparams.csv_train)
+            self.df_valid = pd.read_parquet(self.hparams.csv_valid)
+            self.df_test = pd.read_parquet(self.hparams.csv_test)
 
         cj = transforms.ColorJitter(
             brightness=[.8, 1.2],
@@ -1836,6 +1843,64 @@ class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
             ScaleIntensityd(keys=["img"]),
         ])
 
+        self.mount_point = self.hparams.mount_point
+        self.batch_size = self.hparams.batch_size
+        self.num_workers = self.hparams.num_workers
+        self.drop_last = self.hparams.drop_last
+        self.prefetch_factor = self.hparams.prefetch_factor
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("TTDataModuleSegPklGPUTrans")
+        group.add_argument(
+            "--mount_point",
+            type=str,
+            default="./",
+            help="Mount point for paths in the CSV",
+        )
+        group.add_argument(
+            "--csv_train",
+            type=str,
+            required=True,
+            help="Training data csv file path",
+        )
+        group.add_argument(
+            "--csv_valid",
+            type=str,
+            required=True,
+            help="Validation data csv file path",
+        )
+        group.add_argument(
+            "--csv_test",
+            type=str,
+            required=True,
+            help="Test data csv file path",
+        )
+        group.add_argument(
+            "--batch_size",
+            type=int,
+            default=1,
+            help="Batch size for dataloaders",
+        )
+        group.add_argument(
+            "--num_workers",
+            type=int,
+            default=4,
+            help="DataLoader num_workers",
+        )
+        group.add_argument(
+            "--drop_last",            
+            action='store_true',            
+            help="Drop last if it's not a full batch",
+        )
+        group.add_argument(
+            "--prefetch_factor",
+            type=int,
+            default=2,
+            help="DataLoader prefetch_factor",
+        )
+        return parent_parser
+
     def setup(self, stage=None):
         self.train_ds = monai.data.Dataset(
             data=TTDatasetSegPkl(
@@ -1847,7 +1912,7 @@ class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
 
         self.val_ds = monai.data.Dataset(
             data=TTDatasetSegPkl(
-                self.df_val,
+                self.df_valid,
                 mount_point=self.mount_point,
                 transform=self.val_transform,
             )
@@ -1868,7 +1933,7 @@ class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             shuffle=True,
-            prefetch_factor=2,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -1880,7 +1945,7 @@ class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             collate_fn=pad_list_data_collate,
-            prefetch_factor=2,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -1892,7 +1957,7 @@ class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             collate_fn=pad_list_data_collate,
-            prefetch_factor=2,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=True,
             persistent_workers=True,
         )

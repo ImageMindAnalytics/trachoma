@@ -388,7 +388,7 @@ class TTUNet(pl.LightningModule):
         self.save_hyperparameters()
 
         if hasattr(self.hparams, "ce_weight") and self.hparams.ce_weight is not None:
-            self.loss = monai.losses.DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, ce_weight=torch.tensor(self.hparams.ce_weight), lambda_dice=1.0, lambda_ce=1.0)
+            self.loss = monai.losses.DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, weight=torch.tensor(self.hparams.ce_weight), lambda_dice=1.0, lambda_ce=1.0)
         else:
             self.loss = monai.losses.DiceLoss(include_background=False, softmax=True, to_onehot_y=True)
         
@@ -406,6 +406,14 @@ class TTUNet(pl.LightningModule):
         self.rare_classes = [2, 3, 4, 5, 6]
         self.val_rare_intersections = []
         self.val_rare_denominators = []
+
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("TTUNet")
+        group.add_argument('--lr', '--learning-rate', default=1e-4, type=float, help='Learning rate')
+        group.add_argument('--out_channels', type=int, default=4, help='Number of output channels')
+        group.add_argument('--ce_weight', type=float, default=None, nargs='+', help='Cross entropy weight')
+        return parent_parser
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
