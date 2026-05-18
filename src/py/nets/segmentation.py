@@ -411,8 +411,9 @@ class TTUNet(pl.LightningModule):
     def add_model_specific_args(parent_parser):
         group = parent_parser.add_argument_group("TTUNet")
         group.add_argument('--lr', '--learning-rate', default=1e-4, type=float, help='Learning rate')
+        group.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
         group.add_argument('--out_channels', type=int, default=4, help='Number of output channels')
-        group.add_argument('--ce_weight', type=float, default=None, nargs='+', help='Cross entropy weight')
+        group.add_argument('--ce_weight', type=float, default=None, nargs='+', help='Cross entropy weight')        
         return parent_parser
 
     def configure_optimizers(self):
@@ -515,8 +516,8 @@ class TTUNet(pl.LightningModule):
         lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
         ce_weight = []
-        for i in range(5):
-            ce_weight.append(trial.suggest_float(f"ce_weight_{i}", 0.0, 1.0, log=True))
+        for i in range(7):
+            ce_weight.append(trial.suggest_float(f"ce_weight_{i}", 1e-6, 1.0, log=True))
         return {
             "lr": lr,
             "ce_weight": ce_weight,

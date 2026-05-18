@@ -1,10 +1,12 @@
 import argparse
+import json
 import os
 
 import torch
 
 from loaders import tt_dataset
 from nets import segmentation
+from callbacks.best_metric import BestMetricTracker
 
 from lightning import Trainer
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
@@ -33,6 +35,7 @@ def add_train_args(parser):
     output_group.add_argument('--out', help='Output directory', type=str, default='./')
     output_group.add_argument('--monitor', help='Metric to monitor to save checkpoints', type=str, default='val_loss')
     output_group.add_argument('--monitor_mode', help='Monitor mode (min or max)', type=str, default='min')
+    output_group.add_argument('--write_metric', help='Write monitored metric to file (for Optuna subprocess)', type=str, default=None)
 
     log_group = parser.add_argument_group('Logger')
     log_group.add_argument('--log_every_n_steps', help='Log every n steps', type=int, default=10)
@@ -72,7 +75,9 @@ def main(args):
         mode=args.monitor_mode,
     )
 
-    callbacks = [early_stop_callback, checkpoint_callback]
+    best_tracker = BestMetricTracker(monitor=args.monitor, mode=args.monitor_mode)
+
+    callbacks = [early_stop_callback, checkpoint_callback, best_tracker]
 
     if args.mlflow_tags:
         logger_mlflow = MLFlowLogger(
@@ -96,6 +101,12 @@ def main(args):
     )
 
     trainer.fit(model, datamodule=datamodule, ckpt_path=args.model)
+
+    if getattr(args, 'write_metric', None) and trainer.strategy.global_rank == 0:
+        fit_metrics = {best_tracker.monitor: best_tracker.best}
+        with open(args.write_metric, 'w') as f:
+            json.dump(fit_metrics, f)
+
     trainer.test(model, datamodule=datamodule)
 
 
