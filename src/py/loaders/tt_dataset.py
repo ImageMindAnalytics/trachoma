@@ -1625,47 +1625,14 @@ class TTDatasetSegPkl(Dataset):
                 img_seg['seg'] = img_seg['seg'].squeeze(0) if img_seg['seg'].ndim == 4 else img_seg['seg']
 
             self.buffer.append(img_seg)
-        
-
     def __len__(self):
         return len(self.df)
-
+    
     def __getitem__(self, idx):
         sample = self.buffer[idx]
-        sample['img'] = sample['img'].float()/255.0
-        sample['seg'] = sample['seg'].float()
-
+        sample["img"] = sample["img"].float() / 255.0
+        sample["seg"] = sample["seg"].float()
         return self.transform(sample)
-
-        
-        
-class TTDataModuleSegPkl(pl.LightningDataModule):
-    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4):
-        super().__init__()
-
-        self.df_train = df_train
-        self.df_val = df_val
-        self.df_test = df_test
-        self.mount_point = mount_point
-        self.batch_size = batch_size
-        self.num_workers = num_workers        
-        self.drop_last=True
-        cj = transforms.ColorJitter(brightness=[.8, 1.2], contrast=[0.8, 1.2], saturation=[.8, 1.2], hue=[-.1, .1])
-        self.train_transform = transforms.Compose([
-            ScaleIntensityd(keys=["img"]),
-            Lambdad(keys=['img'], func=lambda x: cj(x)),            
-        ])        
-        self.val_transform = ScaleIntensityd(keys=["img"])
-        self.test_transform = ScaleIntensityd(keys=["img"])
-
-    def setup(self, stage=None):
-
-        # Assign train/val datasets for use in dataloaders
-        self.train_ds = monai.data.Dataset(data=TTDatasetSegPkl(self.df_train, mount_point=self.mount_point, transform=self.train_transform))
-
-        self.val_ds = monai.data.Dataset(TTDatasetSegPkl(self.df_val, mount_point=self.mount_point, transform=self.val_transform))
-        self.test_ds = monai.data.Dataset(TTDatasetSegPkl(self.df_test, mount_point=self.mount_point, transform=self.test_transform))
-
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, 
                           drop_last=self.drop_last, 
@@ -1963,17 +1930,40 @@ class TTDataModuleSegPklGPUTrans(pl.LightningDataModule):
         )
         
 # to use DiceCELoss
-class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
-    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=1, num_workers=4):
-        super().__init__()
+"""
+TTDataModuleSegPklGPUResize
 
-        self.df_train = df_train
-        self.df_val = df_val
-        self.df_test = df_test
-        self.mount_point = mount_point
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.drop_last = True
+Designed to move heavy geometric augmentations
+(zoom / rotation / interpolation) from CPU DataLoader workers
+to GPU training_step execution.
+
+CPU side:
+    - load .pkl
+    - lightweight preprocessing only
+
+GPU side:
+    - affine_grid / grid_sample based augmentations
+    - resize / interpolation transforms
+
+Main difference from TTDataModuleSegPklGPUTrans:
+augmentation execution location (GPU vs CPU), not just resizing.
+"""
+
+class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.save_hyperparameters(logger=False)
+
+        if os.path.splitext(self.hparams.csv_train)[1] == ".csv":
+            self.df_train = pd.read_csv(self.hparams.csv_train)
+            self.df_val = pd.read_csv(self.hparams.csv_valid)
+            self.df_test = pd.read_csv(self.hparams.csv_test)
+        
+        self.mount_point = self.hparams.mount_point
+        self.batch_size = self.hparams.batch_size
+        self.num_workers = self.hparams.num_workers
+        self.drop_last = getattr(self.hparams, "drop_last", False)
+        self.prefetch_factor = getattr(self.hparams, "prefetch_factor", 2)
 
         # cj = transforms.ColorJitter(
         #     brightness=[.8, 1.2],
@@ -2006,32 +1996,43 @@ class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
             Resized(keys=["img", "seg"], spatial_size=[512, 512], mode=["area", "nearest"]),
             ScaleIntensityd(keys=["img"]),
         ])
+        
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("TTDataModuleSegPklGPUResize")
+    
+        group.add_argument("--mount_point", type=str, default="./")
+        group.add_argument("--csv_train", type=str, required=True)
+        group.add_argument("--csv_valid", type=str, required=True)
+        group.add_argument("--csv_test", type=str, required=True)
+    
+        group.add_argument("--batch_size", type=int, default=1)
+        group.add_argument("--num_workers", type=int, default=4)
+    
+        group.add_argument("--drop_last", action="store_true")
+        group.add_argument("--prefetch_factor", type=int, default=2)
+    
+        return parent_parser
 
     def setup(self, stage=None):
-        self.train_ds = monai.data.Dataset(
-            data=TTDatasetSegPkl(
-                self.df_train,
-                mount_point=self.mount_point,
-                transform=self.train_transform,
-            )
+        self.train_ds = TTDatasetSegPkl(
+            self.df_train,
+            mount_point=self.mount_point,
+            transform=self.train_transform,
         )
 
-        self.val_ds = monai.data.Dataset(
-            data=TTDatasetSegPkl(
-                self.df_val,
-                mount_point=self.mount_point,
-                transform=self.val_transform,
-            )
+        self.val_ds = TTDatasetSegPkl(
+            self.df_val,
+            mount_point=self.mount_point,
+            transform=self.val_transform,
         )
-
-        self.test_ds = monai.data.Dataset(
-            data=TTDatasetSegPkl(
-                self.df_test,
-                mount_point=self.mount_point,
-                transform=self.test_transform,
-            )
+        
+        self.test_ds = TTDatasetSegPkl(
+            self.df_test,
+            mount_point=self.mount_point,
+            transform=self.test_transform,
         )
-
+        
     def train_dataloader(self):
         return DataLoader(
             self.train_ds,
@@ -2039,7 +2040,7 @@ class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             shuffle=True,
-            prefetch_factor=2,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -2051,7 +2052,7 @@ class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             collate_fn=pad_list_data_collate,
-            prefetch_factor=2,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -2063,7 +2064,7 @@ class TTDataModuleSegPklGPUResize(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             collate_fn=pad_list_data_collate,
-            prefetch_factor=2,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=True,
             persistent_workers=True,
         )
