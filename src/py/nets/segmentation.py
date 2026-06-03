@@ -388,7 +388,7 @@ class TTUNet(pl.LightningModule):
         self.save_hyperparameters()
 
         if hasattr(self.hparams, "ce_weight") and self.hparams.ce_weight is not None:
-            self.loss = monai.losses.DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, weight=torch.tensor(self.hparams.ce_weight), lambda_dice=1.0, lambda_ce=1.0)
+            self.loss = monai.losses.DiceCELoss(include_background=False, to_onehot_y=True, softmax=True, ce_weight=torch.tensor(self.hparams.ce_weight), lambda_dice=1.0, lambda_ce=1.0)
         else:
             self.loss = monai.losses.DiceLoss(include_background=False, softmax=True, to_onehot_y=True)
         
@@ -515,9 +515,9 @@ class TTUNet(pl.LightningModule):
     def suggest_hyper_params(trial):
         lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-        ce_weight = []
-        for i in range(7):
-            ce_weight.append(trial.suggest_float(f"ce_weight_{i}", 1e-6, 1.0, log=True))
+        ce_weight = [0.1380, 0.3627] # calculated based on probability
+        for i in range(2, 7):
+            ce_weight.append(trial.suggest_float(f"ce_weight_{i}", 0.3627,20.0, log=True))
         return {
             "lr": lr,
             "ce_weight": ce_weight,
